@@ -473,8 +473,8 @@ static int handle_guest_request(struct snp_guest_dev *snp_dev, u64 exit_code,
 static int get_report(struct snp_guest_dev *snp_dev, struct snp_guest_request_ioctl *arg)
 {
 	struct snp_guest_crypto *crypto = snp_dev->crypto;
-	struct snp_report_resp *resp;
-	struct snp_report_req req;
+	struct snp_report_resp *resp = NULL;
+	struct snp_report_req *req;
 	int rc, resp_len;
 
 	lockdep_assert_held(&snp_cmd_mutex);
@@ -482,8 +482,14 @@ static int get_report(struct snp_guest_dev *snp_dev, struct snp_guest_request_io
 	if (!arg->req_data || !arg->resp_data)
 		return -EINVAL;
 
-	if (copy_from_user(&req, (void __user *)arg->req_data, sizeof(req)))
-		return -EFAULT;
+	req = kmalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	if (copy_from_user(req, (void __user *)arg->req_data, sizeof(*req))) {
+		rc = -EFAULT;
+		goto e_free;
+	}
 
 	/*
 	 * The intermediate response buffer is used while decrypting the
@@ -496,7 +502,7 @@ static int get_report(struct snp_guest_dev *snp_dev, struct snp_guest_request_io
 		return -ENOMEM;
 
 	rc = handle_guest_request(snp_dev, SVM_VMGEXIT_GUEST_REQUEST, arg,
-				  SNP_MSG_REPORT_REQ, &req, sizeof(req), resp->data,
+				  SNP_MSG_REPORT_REQ, req, sizeof(*req), resp->data,
 				  resp_len);
 	if (rc)
 		goto e_free;
@@ -505,6 +511,7 @@ static int get_report(struct snp_guest_dev *snp_dev, struct snp_guest_request_io
 		rc = -EFAULT;
 
 e_free:
+	kfree(req);
 	kfree(resp);
 	return rc;
 }
@@ -513,10 +520,11 @@ static int get_derived_key(struct snp_guest_dev *snp_dev, struct snp_guest_reque
 {
 	struct snp_guest_crypto *crypto = snp_dev->crypto;
 	struct snp_derived_key_resp resp = {0};
-	struct snp_derived_key_req req;
+	struct snp_derived_key_req *req;
 	int rc, resp_len;
 	/* Response data is 64 bytes and max authsize for GCM is 16 bytes. */
-	u8 buf[64 + 16];
+	const size_t buf_size = 64 + 16;
+	u8 *buf = NULL;
 
 	lockdep_assert_held(&snp_cmd_mutex);
 
@@ -532,29 +540,45 @@ static int get_derived_key(struct snp_guest_dev *snp_dev, struct snp_guest_reque
 	if (sizeof(buf) < resp_len)
 		return -ENOMEM;
 
-	if (copy_from_user(&req, (void __user *)arg->req_data, sizeof(req)))
-		return -EFAULT;
+	req = kmalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	if (copy_from_user(req, (void __user *)arg->req_data, sizeof(*req))) {
+		rc = -EFAULT;
+		goto e_free;
+	}
+
+	buf = kzalloc(buf_size, GFP_KERNEL);
+	if (!buf) {
+		rc = -ENOMEM;
+		goto e_free;
+	}
 
 	rc = handle_guest_request(snp_dev, SVM_VMGEXIT_GUEST_REQUEST, arg,
-				  SNP_MSG_KEY_REQ, &req, sizeof(req), buf, resp_len);
+				  SNP_MSG_KEY_REQ, req, sizeof(*req), buf, resp_len);
 	if (rc)
-		return rc;
+		goto e_free;
 
 	memcpy(resp.data, buf, sizeof(resp.data));
 	if (copy_to_user((void __user *)arg->resp_data, &resp, sizeof(resp)))
 		rc = -EFAULT;
 
 	/* The response buffer contains the sensitive data, explicitly clear it. */
-	memzero_explicit(buf, sizeof(buf));
+	memzero_explicit(buf, buf_size);
 	memzero_explicit(&resp, sizeof(resp));
+
+e_free:
+	kfree(req);
+	kfree(buf);
 	return rc;
 }
 
 static int get_ext_report(struct snp_guest_dev *snp_dev, struct snp_guest_request_ioctl *arg)
 {
 	struct snp_guest_crypto *crypto = snp_dev->crypto;
-	struct snp_ext_report_req req;
-	struct snp_report_resp *resp;
+	struct snp_ext_report_req *req;
+	struct snp_report_resp *resp = NULL;
 	int ret, npages = 0, resp_len;
 
 	lockdep_assert_held(&snp_cmd_mutex);
@@ -562,19 +586,29 @@ static int get_ext_report(struct snp_guest_dev *snp_dev, struct snp_guest_reques
 	if (!arg->req_data || !arg->resp_data)
 		return -EINVAL;
 
-	if (copy_from_user(&req, (void __user *)arg->req_data, sizeof(req)))
-		return -EFAULT;
+	req = kmalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	if (copy_from_user(req, (void __user *)arg->req_data, sizeof(*req))) {
+		ret = -EFAULT;
+		goto e_free;
+	}
 
 	/* userspace does not want certificate data */
-	if (!req.certs_len || !req.certs_address)
+	if (!req->certs_len || !req->certs_address)
 		goto cmd;
 
-	if (req.certs_len > SEV_FW_BLOB_MAX_SIZE ||
-	    !IS_ALIGNED(req.certs_len, PAGE_SIZE))
-		return -EINVAL;
+	if (req->certs_len > SEV_FW_BLOB_MAX_SIZE ||
+	    !IS_ALIGNED(req->certs_len, PAGE_SIZE)) {
+		ret = -EINVAL;
+		goto e_free;
+	}
 
-	if (!access_ok((const void __user *)req.certs_address, req.certs_len))
-		return -EFAULT;
+	if (!access_ok((const void __user *)req->certs_address, req->certs_len)) {
+		ret = -EFAULT;
+		goto e_free;
+	}
 
 	/*
 	 * Initialize the intermediate buffer with all zeros. This buffer
@@ -582,8 +616,8 @@ static int get_ext_report(struct snp_guest_dev *snp_dev, struct snp_guest_reques
 	 * the host. If host does not supply any certs in it, then copy
 	 * zeros to indicate that certificate data was not provided.
 	 */
-	memset(snp_dev->certs_data, 0, req.certs_len);
-	npages = req.certs_len >> PAGE_SHIFT;
+	memset(snp_dev->certs_data, 0, req->certs_len);
+	npages = req->certs_len >> PAGE_SHIFT;
 cmd:
 	/*
 	 * The intermediate response buffer is used while decrypting the
@@ -597,14 +631,14 @@ cmd:
 
 	snp_dev->input.data_npages = npages;
 	ret = handle_guest_request(snp_dev, SVM_VMGEXIT_EXT_GUEST_REQUEST, arg,
-				   SNP_MSG_REPORT_REQ, &req.data,
-				   sizeof(req.data), resp->data, resp_len);
+				   SNP_MSG_REPORT_REQ, &req->data,
+				   sizeof(req->data), resp->data, resp_len);
 
 	/* If certs length is invalid then copy the returned length */
 	if (arg->vmm_error == SNP_GUEST_VMM_ERR_INVALID_LEN) {
-		req.certs_len = snp_dev->input.data_npages << PAGE_SHIFT;
+		req->certs_len = snp_dev->input.data_npages << PAGE_SHIFT;
 
-		if (copy_to_user((void __user *)arg->req_data, &req, sizeof(req)))
+		if (copy_to_user((void __user *)arg->req_data, req, sizeof(*req)))
 			ret = -EFAULT;
 	}
 
@@ -612,8 +646,8 @@ cmd:
 		goto e_free;
 
 	if (npages &&
-	    copy_to_user((void __user *)req.certs_address, snp_dev->certs_data,
-			 req.certs_len)) {
+	    copy_to_user((void __user *)req->certs_address, snp_dev->certs_data,
+			 req->certs_len)) {
 		ret = -EFAULT;
 		goto e_free;
 	}
@@ -622,6 +656,7 @@ cmd:
 		ret = -EFAULT;
 
 e_free:
+	kfree(req);
 	kfree(resp);
 	return ret;
 }
